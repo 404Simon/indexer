@@ -7,6 +7,7 @@ namespace App\Console\Commands;
 use App\Services\PdfKeywordIndexerService;
 use Exception;
 use Illuminate\Console\Command;
+use Illuminate\Support\Collection;
 use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\File;
 
@@ -29,107 +30,146 @@ final class IndexPdfKeywords extends Command
         $format = $this->option('format');
         $divider = $this->option('divider');
 
-        if (! File::exists($filePath)) {
-            $this->error("File not found: {$filePath}");
-
+        if (! $this->validateInputs($filePath, $divider)) {
             return self::FAILURE;
         }
 
-        if (! str_ends_with(strtolower($filePath), '.pdf')) {
-            $this->error('File must be a PDF document');
-
-            return self::FAILURE;
-        }
-
-        // Validate divider option
-        if ($divider !== null) {
-            $divider = (int) $divider;
-            if ($divider < 1) {
-                $this->error('Divider must be a positive integer');
-
-                return self::FAILURE;
-            }
-        }
-
-        $this->info("Processing PDF: {$filePath}");
-        if ($divider) {
-            $this->info("Using page divider: {$divider} (every {$divider} original pages = 1 indexed page)");
-        }
-        $this->newLine();
+        $this->displayProcessingInfo($filePath, $divider);
 
         try {
             $pageTexts = $indexerService->extractPageTexts($filePath);
-            $totalPages = count($pageTexts);
 
-            if ($totalPages === 0) {
+            if ($pageTexts->isEmpty()) {
                 $this->error('No readable text found in PDF');
 
                 return self::FAILURE;
             }
 
-            $this->info("Found {$totalPages} pages with text content");
+            $this->info("Found {$pageTexts->count()} pages with text content");
 
-            $progressBar = $this->output->createProgressBar($totalPages);
+            $progressBar = $this->output->createProgressBar($pageTexts->count());
             $progressBar->start();
 
-            $extractedKeywords = [];
-
-            foreach ($pageTexts as $pageIndex => $text) {
-                $cacheKey = 'keywords_'.md5($text.$customPrompt);
-                $keywords = Cache::rememberForever($cacheKey, function () use ($indexerService, $text, $customPrompt) {
-                    return $indexerService->extractKeywordsFromText($text, $customPrompt);
-                });
-
-                foreach ($keywords as $keyword) {
-                    $originalPageNumber = $pageIndex + 1;
-                    $adjustedPageNumber = $divider
-                        ? (int) ceil($originalPageNumber / $divider)
-                        : $originalPageNumber;
-
-                    $extractedKeywords[$keyword][] = $adjustedPageNumber;
-                }
-
-                $progressBar->advance();
-            }
+            $extractedKeywords = $this->processPages(
+                $pageTexts,
+                $indexerService,
+                $customPrompt,
+                $divider,
+                $progressBar
+            );
 
             $progressBar->finish();
             $this->newLine(2);
 
-            // cleanup
-            $extractedKeywords = collect($extractedKeywords)
-                ->map(fn ($pages) => collect($pages)->unique()->sort()->values()->toArray())
-                ->sortKeys()
-                ->toArray();
+            $this->displayResults($extractedKeywords, $pageTexts->count(), $divider);
 
-            $keywordCount = count($extractedKeywords);
-            $this->info("Extraction completed! Found {$keywordCount} unique keywords.");
+            $content = $this->formatOutput($extractedKeywords, $format, $indexerService);
 
-            if ($divider) {
-                $finalPageCount = $divider ? (int) ceil($totalPages / $divider) : $totalPages;
-                $this->info("Original pages: {$totalPages} → Indexed pages: {$finalPageCount}");
-            }
-
-            $content = match ($format) {
-                'json' => json_encode($extractedKeywords, JSON_PRETTY_PRINT | JSON_UNESCAPED_UNICODE),
-                'txt' => $indexerService->generateIndexFile($extractedKeywords),
-                default => throw new Exception("Unsupported format: {$format}")
-            };
-
-            if ($outputPath) {
-                File::put($outputPath, $content);
-                $this->info("Index saved to: {$outputPath}");
-            } else {
-                $this->newLine();
-                $this->line($content);
-            }
+            $this->handleOutput($content, $outputPath);
 
             return self::SUCCESS;
-
         } catch (Exception $e) {
             $this->newLine();
             $this->error("Error: {$e->getMessage()}");
 
             return self::FAILURE;
+        }
+    }
+
+    private function validateInputs(string $filePath, ?string $divider): bool
+    {
+        return collect([
+            fn () => File::exists($filePath) ?: $this->error("File not found: {$filePath}"),
+            fn () => str_ends_with(strtolower($filePath), '.pdf') ?: $this->error('File must be a PDF document'),
+            fn () => $divider === null || (int) $divider >= 1 ?: $this->error('Divider must be a positive integer'),
+        ])->every(fn ($validator) => $validator());
+    }
+
+    private function displayProcessingInfo(string $filePath, ?string $divider): void
+    {
+        $this->info("Processing PDF: {$filePath}");
+
+        when($divider, fn () => $this->info(
+            "Using page divider: {$divider} (every {$divider} original pages = 1 indexed page)"
+        ));
+
+        $this->newLine();
+    }
+
+    private function processPages(
+        Collection $pageTexts,
+        PdfKeywordIndexerService $indexerService,
+        ?string $customPrompt,
+        ?string $divider,
+        $progressBar
+    ): array {
+        $dividerInt = $divider ? (int) $divider : null;
+
+        return $pageTexts
+            ->flatMap(function (string $text, int $pageIndex) use (
+                $indexerService,
+                $customPrompt,
+                $dividerInt,
+                $progressBar
+            ) {
+                $cacheKey = 'keywords_'.md5($text.$customPrompt);
+                $keywords = Cache::rememberForever(
+                    $cacheKey,
+                    fn () => $indexerService->extractKeywordsFromText($text, $customPrompt)
+                );
+
+                $originalPageNumber = $pageIndex + 1;
+                $adjustedPageNumber = $dividerInt
+                    ? (int) ceil($originalPageNumber / $dividerInt)
+                    : $originalPageNumber;
+
+                $progressBar->advance();
+
+                return collect($keywords)->map(fn ($keyword) => [
+                    'keyword' => $keyword,
+                    'page' => $adjustedPageNumber,
+                ]);
+            })
+            ->groupBy('keyword')
+            ->map(fn ($group) => $group->pluck('page')->unique()->sort()->values()->toArray())
+            ->sortKeys()
+            ->toArray();
+    }
+
+    private function displayResults(array $extractedKeywords, int $totalPages, ?string $divider): void
+    {
+        $keywordCount = count($extractedKeywords);
+        $this->info("Extraction completed! Found {$keywordCount} unique keywords.");
+
+        when($divider, function () use ($totalPages, $divider) {
+            $finalPageCount = (int) ceil($totalPages / (int) $divider);
+            $this->info("Original pages: {$totalPages} → Indexed pages: {$finalPageCount}");
+        });
+    }
+
+    private function formatOutput(
+        array $extractedKeywords,
+        string $format,
+        PdfKeywordIndexerService $indexerService
+    ): string {
+        return match ($format) {
+            'json' => json_encode(
+                $extractedKeywords,
+                JSON_PRETTY_PRINT | JSON_UNESCAPED_UNICODE
+            ),
+            'txt' => $indexerService->generateIndexFile($extractedKeywords),
+            default => throw new Exception("Unsupported format: {$format}"),
+        };
+    }
+
+    private function handleOutput(string $content, ?string $outputPath): void
+    {
+        if ($outputPath) {
+            File::put($outputPath, $content);
+            $this->info("Index saved to: {$outputPath}");
+        } else {
+            $this->newLine();
+            $this->line($content);
         }
     }
 }

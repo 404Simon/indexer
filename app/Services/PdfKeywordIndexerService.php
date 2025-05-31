@@ -7,7 +7,9 @@ namespace App\Services;
 use App\Events\PdfIndexingCompleted;
 use App\Events\PdfIndexingProgress;
 use Exception;
+use Illuminate\Support\Collection;
 use Illuminate\Support\Facades\Log;
+use Illuminate\Support\Str;
 use Prism\Prism\Enums\Provider;
 use Prism\Prism\Prism;
 use Prism\Prism\Schema\ArraySchema;
@@ -22,7 +24,7 @@ final readonly class PdfKeywordIndexerService
         private string $defaultSystemPrompt = 'Du bist Informatikexperte und Keyword-Extractor. Wenn dir ein Text gegeben wird, extrahiere bitte alle relevanten Informatikbegriffe, bringe sie in ihre Singularform und gebe sie als Liste zurück. Fokussiere dich auf technische Begriffe, Konzepte, Algorithmen, Programmiersprachen, Frameworks, Tools und andere wichtige Informatikthemen.'
     ) {}
 
-    public function extractPageTexts(string $filePath): array
+    public function extractPageTexts(string $filePath): Collection
     {
         $pdf = $this->pdfParser->parseFile($filePath);
         $pages = $pdf->getPages();
@@ -32,8 +34,7 @@ final readonly class PdfKeywordIndexerService
             ->filter(fn ($text) => $text !== '')
             ->map(fn ($text) => $this->sanitizeText($text))
             ->map(fn ($text) => strlen($text) > 5000 ? substr($text, 0, 5000) : $text)
-            ->values()
-            ->toArray();
+            ->values();
     }
 
     public function processDocument(
@@ -81,7 +82,7 @@ final readonly class PdfKeywordIndexerService
     public function extractKeywordsFromText(
         string $text,
         ?string $systemPrompt = null
-    ): array {
+    ): Collection {
         $systemPrompt ??= $this->defaultSystemPrompt;
         $sanitizedText = $this->sanitizeText($text);
 
@@ -109,7 +110,7 @@ final readonly class PdfKeywordIndexerService
                 ->withPrompt($systemPrompt."\n\nText to analyze:\n".$sanitizedText)
                 ->asStructured();
 
-            return $response->structured['keywords'] ?? [];
+            return collect($response->structured['keywords'])->map(fn ($k) => Str::lower($k)) ?? [];
         } catch (Exception $e) {
             Log::error('AI keyword extraction failed', [
                 'error' => $e->getMessage(),
