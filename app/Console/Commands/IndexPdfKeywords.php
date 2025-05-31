@@ -7,6 +7,7 @@ namespace App\Console\Commands;
 use App\Services\PdfKeywordIndexerService;
 use Exception;
 use Illuminate\Console\Command;
+use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\File;
 
 final class IndexPdfKeywords extends Command
@@ -74,7 +75,10 @@ final class IndexPdfKeywords extends Command
             $extractedKeywords = [];
 
             foreach ($pageTexts as $pageIndex => $text) {
-                $keywords = $indexerService->extractKeywordsFromText($text, $customPrompt);
+                $cacheKey = 'keywords_'.md5($text.$customPrompt);
+                $keywords = Cache::rememberForever($cacheKey, function () use ($indexerService, $text, $customPrompt) {
+                    return $indexerService->extractKeywordsFromText($text, $customPrompt);
+                });
 
                 foreach ($keywords as $keyword) {
                     $originalPageNumber = $pageIndex + 1;
